@@ -452,6 +452,8 @@ const SCHEMA: Record<string, TypeDef> = {
           issue.state = 'closed';
           issue.updatedAt = ctx.store.clock.nextIso();
           issue.closedAt = issue.updatedAt;
+          // Invalidate the REST layer's cached serialization of this issue.
+          issue.version += 1;
           return { __typename: 'CloseIssuePayload', issue: issueObject(repo, issue) };
         },
       },

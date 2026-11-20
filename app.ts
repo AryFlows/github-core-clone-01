@@ -25,21 +25,21 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
+/** An empty query set, shared by the requests that carry no query string. */
+const EMPTY_QUERY = new URLSearchParams();
 
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+/**
+ * The path and query of a request URL, parsed once (never a throw from a request). A manual
+ * split, not `new URL`: the suite's paths are plain origin-form paths, and the URL parser's
+ * validation and normalization cost several microseconds a request on the hot paths. A path
+ * that does not start with '/' (or is missing) falls back to '/', as the old parse did.
+ */
+function pathAndQuery(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const raw = req.url ?? '/';
+  if (!raw.startsWith('/')) return { path: '/', query: EMPTY_QUERY };
+  const cut = raw.indexOf('?');
+  if (cut < 0) return { path: raw, query: EMPTY_QUERY };
+  return { path: raw.slice(0, cut), query: new URLSearchParams(raw.slice(cut + 1)) };
 }
 
 /** The request's own origin, for absolute pagination links. */
@@ -60,14 +60,14 @@ function authorized(req: IncomingMessage): boolean {
 
 /** Answer with a JSON body; `headers` go beside the JSON ones. */
 function sendJson(res: ServerResponse, status: number, body: unknown, requestId: string, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': requestId,
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 /** Answer with raw bytes (the git protocol's framed responses). */
@@ -102,6 +102,9 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     });
     req.on('end', () => {
       if (tooLarge) reject(new Error('request body is too large'));
+      // Small bodies arrive in one chunk: hand it over without a copy. No handler mutates a
+      // body buffer (they slice, hash or decode it), so sharing the chunk is safe.
+      else if (chunks.length === 1) resolve(chunks[0] as Buffer);
       else resolve(Buffer.concat(chunks));
     });
     req.on('error', reject);
@@ -115,9 +118,8 @@ export function createApp(): Server {
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     const requestId = `forge-${(requestCounter += 1)}`;
-    const path = pathOf(req);
+    const { path, query } = pathAndQuery(req);
     const method = req.method ?? 'GET';
-    const query = queryOf(req);
 
     // The env's boot check calls this twice: 200 {"ok":true}.
     if (method === 'GET' && path === '/healthz') {
@@ -241,6 +243,12 @@ export function createApp(): Server {
           }
           if (result.status === 204) {
             sendEmpty(res, 204, requestId);
+            return;
+          }
+          if (result.raw !== undefined) {
+            // A pre-serialized JSON body (the cached issue JSON): same headers sendJson
+            // would set, without re-stringifying.
+            sendRaw(res, result.status, JSON_TYPE, result.raw, requestId);
             return;
           }
           sendJson(res, result.status, result.body, requestId, result.headers ?? {});

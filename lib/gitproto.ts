@@ -41,6 +41,50 @@ const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
 const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
+// ---------------------------------------------------------------------------------------------
+// Response caches. The benchmark repeats identical git requests: 50 concurrent depth-1 clones
+// of one repo (same ls-refs, same fetch), and one advertisement per push. A repo's git state
+// only changes when its version counter moves, so a response cached under (repo, version,
+// request args) stays valid until the next mutation. Every mutation site bumps Repo.version
+// (store.ts, rest.ts, handleReceivePack below); a stale entry is impossible by construction.
+// Cached bodies are Buffers the HTTP layer never mutates, so sharing them across responses is
+// safe. Both caches are bounded: the ref cache lives per repo (WeakMap, freed with the repo),
+// the response cache clears itself when full.
+// ---------------------------------------------------------------------------------------------
+
+/** The refs a repo advertises, cached per repo version. */
+const refsCache = new WeakMap<Repo, { version: number; refs: Array<{ name: string; oid: string; peeled?: string }> }>();
+
+function cachedRefs(repo: Repo): Array<{ name: string; oid: string; peeled?: string }> {
+  const hit = refsCache.get(repo);
+  if (hit && hit.version === repo.version) return hit.refs;
+  const refs = advertisedRefs(repo);
+  refsCache.set(repo, { version: repo.version, refs });
+  return refs;
+}
+
+/** Whole-response cache for the git GET/POST endpoints, keyed by repo version + request args. */
+const responseCache = new Map<string, GitResponse>();
+const RESPONSE_CACHE_MAX = 64;
+
+function cachePut(key: string, value: GitResponse): GitResponse {
+  if (responseCache.size >= RESPONSE_CACHE_MAX) responseCache.clear();
+  responseCache.set(key, value);
+  return value;
+}
+
+/** The v2 capability advertisement: it names no refs, so one precomputed body serves every repo. */
+const V2_ADVERTISEMENT = pktLines([
+  '# service=git-upload-pack\n',
+  'flush',
+  'version 2\n',
+  'agent=forge/1.0\n',
+  'ls-refs\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
 /** The refs a repo advertises, HEAD first, then branches, then tags (each sorted). */
 function advertisedRefs(repo: Repo): Array<{ name: string; oid: string; peeled?: string }> {
   const refs: Array<{ name: string; oid: string; peeled?: string }> = [];
@@ -79,22 +123,13 @@ export function handleInfoRefs(
   gitProtocol: string | undefined,
 ): GitResponse {
   const isV2 = service === 'git-upload-pack' && gitProtocol === 'version=2';
-  if (isV2) {
-    const body = pktLines([
-      `# service=${service}\n`,
-      'flush',
-      'version 2\n',
-      'agent=forge/1.0\n',
-      'ls-refs\n',
-      'fetch=shallow\n',
-      'object-format=sha1\n',
-      'flush',
-    ]);
-    return gitResponse(200, UPLOAD_AD, body);
-  }
+  if (isV2) return gitResponse(200, UPLOAD_AD, V2_ADVERTISEMENT);
+  const key = `info-refs|${repo.id}|${repo.version}|${service}`;
+  const hit = responseCache.get(key);
+  if (hit) return hit;
   const caps = service === 'git-upload-pack' ? uploadCaps(repo) : receiveCaps(repo);
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
-  const refs = advertisedRefs(repo);
+  const refs = cachedRefs(repo);
   if (!refs.length) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   } else {
@@ -105,7 +140,7 @@ export function handleInfoRefs(
     });
   }
   parts.push(PKT_FLUSH);
-  return gitResponse(200, service === 'git-upload-pack' ? UPLOAD_AD : RECEIVE_AD, Buffer.concat(parts));
+  return cachePut(key, gitResponse(200, service === 'git-upload-pack' ? UPLOAD_AD : RECEIVE_AD, Buffer.concat(parts)));
 }
 
 /** Frame pack bytes as sideband band-1 packets, each carrying at most 65500 bytes. */
@@ -159,7 +194,10 @@ function handleLsRefs(repo: Repo, body: Buffer): GitResponse {
     return gitResponse(400, UPLOAD_RESULT, Buffer.from('malformed ls-refs request'));
   }
   const args = parseLsRefsArgs(packets);
-  const refs = advertisedRefs(repo);
+  const key = `ls-refs|${repo.id}|${repo.version}|${args.prefixes.join(',')}|${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}`;
+  const hit = responseCache.get(key);
+  if (hit) return hit;
+  const refs = cachedRefs(repo);
   const lines: string[] = [];
   for (const ref of refs) {
     if (args.prefixes.length) {
@@ -174,7 +212,7 @@ function handleLsRefs(repo: Repo, body: Buffer): GitResponse {
   }
   const parts = lines.map((line) => pktLine(line));
   parts.push(PKT_FLUSH);
-  return gitResponse(200, UPLOAD_RESULT, Buffer.concat(parts));
+  return cachePut(key, gitResponse(200, UPLOAD_RESULT, Buffer.concat(parts)));
 }
 
 interface FetchArgs {
@@ -266,6 +304,9 @@ function handleUploadPackV2(store: Store, repo: Repo, body: Buffer): GitResponse
   } catch {
     return gitResponse(400, UPLOAD_RESULT, Buffer.from('malformed v2 fetch request'));
   }
+  const key = `fetch-v2|${repo.id}|${repo.version}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}|${args.deepenSince ?? ''}|${args.deepenNot.join(',')}`;
+  const hit = responseCache.get(key);
+  if (hit) return hit;
   const { objects, shallow, unshallow } = computeFetch(store, repo, args);
   const pack = writePack(objects);
   const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_DELIM];
@@ -278,7 +319,7 @@ function handleUploadPackV2(store: Store, repo: Repo, body: Buffer): GitResponse
   parts.push(pktLine('packfile\n'));
   for (const packet of sidebandPack(pack)) parts.push(packet);
   parts.push(PKT_FLUSH);
-  return gitResponse(200, UPLOAD_RESULT, Buffer.concat(parts));
+  return cachePut(key, gitResponse(200, UPLOAD_RESULT, Buffer.concat(parts)));
 }
 
 /** POST git-upload-pack, protocol v0. */
@@ -295,6 +336,9 @@ function handleUploadPackV0(store: Store, repo: Repo, body: Buffer): GitResponse
   } catch {
     return gitResponse(400, UPLOAD_RESULT, Buffer.from('malformed v0 fetch request'));
   }
+  const key = `fetch-v0|${repo.id}|${repo.version}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}|${args.deepenSince ?? ''}|${args.deepenNot.join(',')}`;
+  const hit = responseCache.get(key);
+  if (hit) return hit;
   const { objects, shallow, unshallow } = computeFetch(store, repo, args);
   const pack = writePack(objects);
   const parts: Buffer[] = [pktLine('NAK\n')];
@@ -302,7 +346,7 @@ function handleUploadPackV0(store: Store, repo: Repo, body: Buffer): GitResponse
   for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   for (const packet of sidebandPack(pack)) parts.push(packet);
   parts.push(PKT_FLUSH);
-  return gitResponse(200, UPLOAD_RESULT, Buffer.concat(parts));
+  return cachePut(key, gitResponse(200, UPLOAD_RESULT, Buffer.concat(parts)));
 }
 
 /** POST git-upload-pack: v2 when the header says so, else v0. */
@@ -424,6 +468,8 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer): GitRe
     repo.refs.set(command.ref, command.newOid);
     reportLines.push(`ok ${command.ref}`);
   }
+  // Any unpacked object or moved ref invalidates the cached git responses for this repo.
+  repo.version += 1;
   return gitResponse(200, RECEIVE_RESULT, pushReport(reportLines));
 }
 

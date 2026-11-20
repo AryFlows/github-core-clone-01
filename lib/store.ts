@@ -33,6 +33,12 @@ export interface Repo {
   defaultBranch: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Bumped on every mutation of this repo's refs or git objects. The git layer caches whole
+   * responses under (repo, version, request args); a bump invalidates every cached response for
+   * the repo, so a stale entry is impossible as long as every mutation site bumps it.
+   */
+  version: number;
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
   labels: Map<string, Label>;
@@ -62,6 +68,12 @@ export interface Issue {
   updatedAt: string;
   closedAt: string | null;
   author: string;
+  /**
+   * Bumped on every mutation of this issue's REST-visible fields (PATCH, GraphQL close,
+   * comment add). The REST layer caches the issue's serialized JSON under this version,
+   * so a stale entry is impossible as long as every mutation site bumps it.
+   */
+  version: number;
 }
 
 export interface Comment {
@@ -88,6 +100,8 @@ export interface Pull {
   createdAt: string;
   updatedAt: string;
   comments: Comment[];
+  /** Same role as Issue.version: bumped by addComment, which takes either target. */
+  version: number;
 }
 
 export interface Change {
@@ -143,6 +157,7 @@ export class Store {
       defaultBranch: 'main',
       createdAt: now,
       updatedAt: now,
+      version: 0,
       objects: new Map(),
       refs: new Map(),
       labels: new Map(),
@@ -260,6 +275,7 @@ export class Store {
       if (!repo.objects.has(oid)) repo.objects.set(oid, { type: 'tree', data });
       treeOidByDir.set(dir, oid);
     }
+    repo.version += 1;
     return treeOidByDir.get('') as string;
   }
 
@@ -267,6 +283,7 @@ export class Store {
   storeBlob(repo: Repo, content: Buffer): string {
     const oid = hashObject('blob', content);
     if (!repo.objects.has(oid)) repo.objects.set(oid, { type: 'blob', data: content });
+    repo.version += 1;
     return oid;
   }
 
@@ -276,6 +293,7 @@ export class Store {
     const data = buildCommit({ tree: fields.tree, parents: fields.parents ?? [], message: fields.message, author: identity, committer: identity });
     const oid = hashObject('commit', data);
     if (!repo.objects.has(oid)) repo.objects.set(oid, { type: 'commit', data });
+    repo.version += 1;
     return oid;
   }
 
@@ -490,6 +508,7 @@ export class Store {
       updatedAt: now,
       closedAt: null,
       author: VIEWER.login,
+      version: 0,
     };
     repo.issues.push(issue);
     repo.issueByNumber.set(number, issue);
@@ -516,6 +535,7 @@ export class Store {
       createdAt: now,
       updatedAt: now,
       comments: [],
+      version: 0,
     };
     repo.pulls.push(pull);
     repo.pullByNumber.set(number, pull);
@@ -533,6 +553,8 @@ export class Store {
     };
     repo.nextCommentId += 1;
     target.comments.push(comment);
+    // A new comment changes the issue's `comments` count in its REST JSON.
+    target.version += 1;
     return comment;
   }
 
@@ -547,6 +569,7 @@ export class Store {
     const message = `${pull.title} (#${pull.number})\n\n${pull.body}`;
     const mergeSha = this.storeCommit(repo, { tree: treeOid, parents: [baseCommitOid], message });
     repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+    repo.version += 1;
     const now = this.clock.nextIso();
     pull.state = 'closed';
     pull.merged = true;

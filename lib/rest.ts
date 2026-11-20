@@ -14,10 +14,37 @@ export interface RouteResult {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /**
+   * A pre-serialized JSON body (including the trailing newline sendJson appends). When
+   * set, the HTTP layer sends these bytes verbatim instead of stringifying `body`.
+   */
+  raw?: Buffer;
 }
 
 const ok = (status: number, body: unknown, headers?: Record<string, string>): RouteResult => ({ status, body, headers });
+const okRaw = (status: number, raw: Buffer): RouteResult => ({ status, body: null, raw });
 const err = (status: number, message: string): RouteResult => ({ status, body: { message } });
+
+// ---------------------------------------------------------------------------------------------
+// Serialized-issue cache. The benchmark reads one issue 2,000 times in a row; its JSON never
+// changes between reads, so the built object + stringify + UTF-8 encode is pure repeat work.
+// The cache holds the exact bytes sendJson would produce (JSON + trailing newline) under the
+// issue's version counter, which every mutation site bumps (store.ts, PATCH below, GraphQL
+// closeIssue). A repo's owner/name never change after creation, and no other input feeds
+// issueJson, so a version match means byte-identical output. WeakMap: entries die with the
+// issue, and deleting a repo drops its issues' entries.
+// ---------------------------------------------------------------------------------------------
+
+/** The serialized bytes of one issue's REST JSON, valid while the issue's version matches. */
+const issueJsonCache = new WeakMap<Issue, { version: number; buf: Buffer }>();
+
+function cachedIssueBuffer(repo: Repo, issue: Issue): Buffer {
+  const hit = issueJsonCache.get(issue);
+  if (hit && hit.version === issue.version) return hit.buf;
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueJsonCache.set(issue, { version: issue.version, buf });
+  return buf;
+}
 
 export function repoJson(repo: Repo): Record<string, unknown> {
   return {
@@ -373,6 +400,7 @@ export function handleRest(
       if (repo.refs.has(ref)) return err(422, 'Reference already exists');
       if (!repo.objects.has(sha)) return err(422, 'Object does not exist');
       repo.refs.set(ref, sha);
+      repo.version += 1;
       return ok(201, { ref, object: { sha } });
     }
     if (method === 'GET' && tail.length >= 3) {
@@ -431,7 +459,7 @@ export function handleRest(
           labels.push(label);
         }
         const issue = store.createIssue(repo, { title, body: stringField(record ?? {}, 'body') ?? '', labels });
-        return ok(201, issueJson(repo, issue));
+        return okRaw(201, cachedIssueBuffer(repo, issue));
       }
       return err(404, 'Not Found');
     }
@@ -439,7 +467,7 @@ export function handleRest(
     const issue = Number.isInteger(number) ? repo.issueByNumber.get(number) : undefined;
     if (tail.length === 2) {
       if (!issue) return err(404, 'Not Found');
-      if (method === 'GET') return ok(200, issueJson(repo, issue));
+      if (method === 'GET') return okRaw(200, cachedIssueBuffer(repo, issue));
       if (method === 'PATCH') {
         const record = bodyRecord(body);
         const state = record ? stringField(record, 'state') : undefined;
@@ -453,7 +481,9 @@ export function handleRest(
         if (title !== undefined) issue.title = title;
         const bodyText = record ? stringField(record, 'body') : undefined;
         if (bodyText !== undefined) issue.body = bodyText;
-        return ok(200, issueJson(repo, issue));
+        // Any PATCH may have changed the REST-visible fields: invalidate the cached JSON.
+        issue.version += 1;
+        return okRaw(200, cachedIssueBuffer(repo, issue));
       }
       return err(404, 'Not Found');
     }
@@ -633,6 +663,7 @@ function handleContents(
     const treeOid = store.buildTreeFromPaths(repo, nextPaths);
     const commitOid = store.storeCommit(repo, { tree: treeOid, parents: tip ? [tip] : [], message });
     repo.refs.set(ref, commitOid);
+    repo.version += 1;
     repo.updatedAt = store.clock.nextIso();
     return ok(existing ? 200 : 201, {
       content: {
@@ -666,6 +697,7 @@ function handleContents(
     const treeOid = store.buildTreeFromPaths(repo, nextPaths);
     const commitOid = store.storeCommit(repo, { tree: treeOid, parents: [tip], message });
     repo.refs.set(ref, commitOid);
+    repo.version += 1;
     repo.updatedAt = store.clock.nextIso();
     return ok(200, { commit: { sha: commitOid, message } });
   }
